@@ -1,0 +1,4 @@
+.DS_Store
+.venv
+jax_dojo.egg-info
+__pycache__

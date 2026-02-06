@@ -73,6 +73,8 @@ class EnvState(NamedTuple):
     lambda_load: jnp.ndarray
     # time step (integer)
     step: jnp.ndarray
+    # prev_action: previous action for smoothness penalty [lambda_sp, p_sp, valve]
+    prev_action: jnp.ndarray
 
 
 def _equilibrium_constant_Kp(T: jnp.ndarray) -> jnp.ndarray:
@@ -158,7 +160,7 @@ def _dynamics(
     p_sp = jnp.clip(action[1], P_MIN_PA, P_NOMINAL_PA)
     recycle_valve = jnp.clip(action[2], 0.01, 1.0)  # 0 = closed, 1 = open
 
-    p, N_gas, T_reactor, w_NH3_in, w_NH3_out, M_loop, lambda_load, step = state
+    p, N_gas, T_reactor, w_NH3_in, w_NH3_out, M_loop, lambda_load, step, _ = state
 
     # Feed molar flow (paper Eq. (1): load = M_H2_feed / M_H2_feed_nominal)
     N_dot_in = lambda_sp * N_dot_in_nominal
@@ -222,12 +224,13 @@ def _dynamics(
         M_loop=M_loop_new,
         lambda_load=lambda_new,
         step=step + 1,
+        prev_action=action,
     )
 
 
 def _observation(state: EnvState) -> jnp.ndarray:
     """Observation vector for RL: normalized/scaled state."""
-    p, N_gas, T_reactor, w_NH3_in, w_NH3_out, M_loop, lambda_load, step = state
+    p, N_gas, T_reactor, w_NH3_in, w_NH3_out, M_loop, lambda_load, step, _ = state
     return jnp.array([
         p / P_NOMINAL_PA,
         N_gas / 1e5,
@@ -241,17 +244,39 @@ def _observation(state: EnvState) -> jnp.ndarray:
 
 
 def _reward(state: EnvState, action: jnp.ndarray) -> jnp.ndarray:
-    """Reward: production (NH3 formation) minus penalties for constraint violation."""
-    _, _, T_reactor, w_NH3_in, w_NH3_out, M_loop, lambda_load, _ = state
+    """Reward: production (NH3 formation) minus penalties for constraint violation and action changes."""
+    p, _, T_reactor, w_NH3_in, w_NH3_out, M_loop, lambda_load, _, prev_action = state
     xi_dot = M_loop / M_NH3 * (state.w_NH3_out - state.w_NH3_in)
     xi_dot = jnp.maximum(xi_dot, 0.0)
     production = xi_dot * M_NH3  # kg/s NH3
+
+    # Temperature penalties
     temp_penalty = jnp.where(
         T_reactor > T_CATALYST_MAX_K - 10.0,
         -1.0,
         jnp.where(T_reactor < T_CATALYST_MIN_K, -0.5, 0.0),
     )
-    return production - 0.1 * temp_penalty
+
+    # Pressure penalties (operating range: 100-152 bar)
+    pressure_penalty = jnp.where(
+        p > P_NOMINAL_PA,
+        -1.0 * (p - P_NOMINAL_PA) / P_NOMINAL_PA,  # proportional penalty for overpressure
+        jnp.where(
+            p < P_MIN_PA,
+            -0.5 * (P_MIN_PA - p) / P_MIN_PA,  # proportional penalty for underpressure
+            0.0,
+        ),
+    )
+
+    # Action smoothness penalty (penalize rapid changes)
+    # Normalize action changes by their respective ranges
+    # action[0]: lambda (0.1-1.0), action[1]: pressure (100e5-152e5), action[2]: valve (0.01-1.0)
+    action_ranges = jnp.array([0.9, 52e5, 0.99])
+    normalized_action_change = (action - prev_action) / action_ranges
+    # Penalize squared changes - coefficient tuned for ~3%/min max recommended load change rate
+    smoothness_penalty = -0.1 * jnp.sum(normalized_action_change ** 2)
+
+    return production + temp_penalty + pressure_penalty + smoothness_penalty
 
 
 # -----------------------------------------------------------------------------
@@ -286,7 +311,7 @@ class HaberBoschEnv(gym.Env[EnvState, jnp.ndarray]):
         self._Ea = Ea
         self._max_steps = max_steps
 
-        # State: p, N_gas, T_reactor, w_NH3_in, w_NH3_out, M_loop, lambda_load, step
+        # State: p, N_gas, T_reactor, w_NH3_in, w_NH3_out, M_loop, lambda_load, step, prev_action
         # Actions: lambda_setpoint [0.1,1], pressure_setpoint [P_MIN, P_NOM], recycle_valve [0,1]
         self.action_space = spaces.Box(
             low=np.array([0.1, P_MIN_PA, 0.01], dtype=np.float32),
@@ -311,6 +336,8 @@ class HaberBoschEnv(gym.Env[EnvState, jnp.ndarray]):
         N_gas0 = p0 * self._V_loop / (self._Z * R_GAS * T_FEED_K)
         T0 = T_FEED_K + 50.0 + 20.0 * jax.random.uniform(k2)
         T0 = jnp.clip(T0, T_FEED_K, T_CATALYST_MAX_K - 20.0)
+        # Initial "neutral" action: nominal load, nominal pressure, valve half-open
+        initial_action = jnp.array([1.0, P_NOMINAL_PA, 0.5], dtype=jnp.float32)
         return EnvState(
             p=p0,
             N_gas=N_gas0,
@@ -320,6 +347,7 @@ class HaberBoschEnv(gym.Env[EnvState, jnp.ndarray]):
             M_loop=jnp.array(2.0 * M_H2_FEED_NOMINAL_KGS, dtype=jnp.float32),
             lambda_load=jnp.array(1.0, dtype=jnp.float32),
             step=jnp.array(0, dtype=jnp.int32),
+            prev_action=initial_action,
         )
 
     def reset(
@@ -353,7 +381,7 @@ class HaberBoschEnv(gym.Env[EnvState, jnp.ndarray]):
         self._state = state_new
         obs = _observation(state_new)
         reward = float(_reward(state_new, action))
-        terminated = state_new.step >= self._max_steps
+        terminated = bool(state_new.step >= self._max_steps)
         truncated = False
         info = {"state": state_new}
         return np.asarray(obs), reward, terminated, truncated, info

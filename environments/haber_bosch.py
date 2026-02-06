@@ -200,16 +200,29 @@ def _dynamics(
     alpha = 0.1
     w_NH3_in_new = (1.0 - alpha) * w_NH3_in + alpha * (w_NH3_out_new * 0.5)  # some NH3 remains in loop
 
-    # Reactor temperature: adiabatic rise from reaction heat. Delta_H = -46.2 kJ/mol NH3 (per mol NH3)
+    # Reactor temperature: balance of reaction heat and cooling
+    # Delta_H = -46.2 kJ/mol NH3 (exothermic)
     delta_H = -46.2e3  # J/mol
     cp_mix = 35.0  # J/(mol·K) approx
+
+    # Heat generation from reaction
+    Q_rxn = -delta_H * xi_dot  # J/s (positive = heating)
+
+    # Heat removal through cooling system (controllable via valve position)
+    # Higher valve = more recycle flow = more cooling via heat exchanger
+    # T_setpoint represents the controller target (influenced by load and valve)
+    T_setpoint = T_FEED_K + 200.0 + 100.0 * lambda_sp  # 340-440°C depending on load
+    k_cool = 0.1 * (0.5 + recycle_valve)  # cooling rate: higher valve = more cooling
+    Q_cool = k_cool * N_gas_new * cp_mix * (T_reactor - T_setpoint)
+
+    # Net temperature change
     dT_dt = jnp.where(
         N_gas_new > 1.0,
-        (-delta_H * xi_dot) / (N_gas_new * cp_mix),
+        (Q_rxn - Q_cool) / (N_gas_new * cp_mix),
         0.0,
     )
     T_reactor_new = T_reactor + dt * dT_dt
-    T_reactor_new = jnp.clip(T_reactor_new, T_FEED_K, T_CATALYST_MAX_K)
+    T_reactor_new = jnp.clip(T_reactor_new, T_FEED_K, T_CATALYST_MAX_K + 20.0)  # Allow slight overshoot
 
     # Load tracks setpoint with first-order lag
     lambda_new = (1.0 - 0.05) * lambda_load + 0.05 * lambda_sp
@@ -244,39 +257,90 @@ def _observation(state: EnvState) -> jnp.ndarray:
 
 
 def _reward(state: EnvState, action: jnp.ndarray) -> jnp.ndarray:
-    """Reward: production (NH3 formation) minus penalties for constraint violation and action changes."""
+    """Reward: production (NH3 formation) minus penalties for constraint violation and action changes.
+
+    Reward design:
+    - Production: scaled to ~1.0 at nominal operation
+    - Temperature: soft margin penalty starting 20K before limits
+    - Pressure: soft margin penalty starting 5 bar before limits
+    - Smoothness: penalize rapid action changes
+    - Safe operation bonus: +0.5 when fully within bounds
+    """
     p, _, T_reactor, w_NH3_in, w_NH3_out, M_loop, lambda_load, _, prev_action = state
     xi_dot = M_loop / M_NH3 * (state.w_NH3_out - state.w_NH3_in)
     xi_dot = jnp.maximum(xi_dot, 0.0)
-    production = xi_dot * M_NH3  # kg/s NH3
+    production_raw = xi_dot * M_NH3  # kg/s NH3
+    # Scale production so nominal ~0.05 kg/s -> reward ~1.0
+    production = production_raw * 20.0
 
-    # Temperature penalties
+    # --- Temperature penalties (soft margin) ---
+    # Safe zone: 370°C - 500°C (20K margins from hard limits 350-520°C)
+    T_SAFE_LOW = T_CATALYST_MIN_K + 20.0   # 370°C
+    T_SAFE_HIGH = T_CATALYST_MAX_K - 20.0  # 500°C
+
+    # Quadratic penalty in margin zone, steep linear beyond hard limit
     temp_penalty = jnp.where(
-        T_reactor > T_CATALYST_MAX_K - 10.0,
-        -1.0,
-        jnp.where(T_reactor < T_CATALYST_MIN_K, -0.5, 0.0),
-    )
-
-    # Pressure penalties (operating range: 100-152 bar)
-    pressure_penalty = jnp.where(
-        p > P_NOMINAL_PA,
-        -1.0 * (p - P_NOMINAL_PA) / P_NOMINAL_PA,  # proportional penalty for overpressure
+        T_reactor > T_CATALYST_MAX_K,
+        # Beyond hard limit: -10 base + steep linear
+        -10.0 - 5.0 * (T_reactor - T_CATALYST_MAX_K) / 10.0,
         jnp.where(
-            p < P_MIN_PA,
-            -0.5 * (P_MIN_PA - p) / P_MIN_PA,  # proportional penalty for underpressure
-            0.0,
+            T_reactor > T_SAFE_HIGH,
+            # In upper margin: quadratic ramp from 0 to -10
+            -10.0 * ((T_reactor - T_SAFE_HIGH) / 20.0) ** 2,
+            jnp.where(
+                T_reactor < T_CATALYST_MIN_K,
+                # Beyond low limit
+                -5.0 - 2.0 * (T_CATALYST_MIN_K - T_reactor) / 10.0,
+                jnp.where(
+                    T_reactor < T_SAFE_LOW,
+                    # In lower margin
+                    -5.0 * ((T_SAFE_LOW - T_reactor) / 20.0) ** 2,
+                    0.0,  # Safe zone
+                ),
+            ),
         ),
     )
 
-    # Action smoothness penalty (penalize rapid changes)
+    # --- Pressure penalties (soft margin) ---
+    # Safe zone: 105-147 bar (5 bar margins from hard limits 100-152 bar)
+    P_SAFE_LOW = P_MIN_PA + 5e5     # 105 bar
+    P_SAFE_HIGH = P_NOMINAL_PA - 5e5  # 147 bar
+
+    pressure_penalty = jnp.where(
+        p > P_NOMINAL_PA,
+        # Beyond upper limit: -5 base + steep linear
+        -5.0 - 10.0 * (p - P_NOMINAL_PA) / P_NOMINAL_PA,
+        jnp.where(
+            p > P_SAFE_HIGH,
+            # In upper margin: quadratic ramp from 0 to -5
+            -5.0 * ((p - P_SAFE_HIGH) / 5e5) ** 2,
+            jnp.where(
+                p < P_MIN_PA,
+                # Beyond low limit
+                -5.0 - 10.0 * (P_MIN_PA - p) / P_MIN_PA,
+                jnp.where(
+                    p < P_SAFE_LOW,
+                    # In lower margin
+                    -5.0 * ((P_SAFE_LOW - p) / 5e5) ** 2,
+                    0.0,  # Safe zone
+                ),
+            ),
+        ),
+    )
+
+    # --- Safe operation bonus ---
+    # Small positive reward for staying fully within safe bounds
+    in_safe_temp = (T_reactor >= T_SAFE_LOW) & (T_reactor <= T_SAFE_HIGH)
+    in_safe_pressure = (p >= P_SAFE_LOW) & (p <= P_SAFE_HIGH)
+    safe_bonus = jnp.where(in_safe_temp & in_safe_pressure, 0.5, 0.0)
+
+    # --- Action smoothness penalty ---
     # Normalize action changes by their respective ranges
-    # action[0]: lambda (0.1-1.0), action[1]: pressure (100e5-152e5), action[2]: valve (0.01-1.0)
     action_ranges = jnp.array([0.9, 52e5, 0.99])
     normalized_action_change = (action - prev_action) / action_ranges
-    # Penalize squared changes - coefficient tuned for ~3%/min max recommended load change rate
-    smoothness_penalty = -0.1 * jnp.sum(normalized_action_change ** 2)
+    smoothness_penalty = -0.5 * jnp.sum(normalized_action_change ** 2)
 
-    return production + temp_penalty + pressure_penalty + smoothness_penalty
+    return production + temp_penalty + pressure_penalty + safe_bonus + smoothness_penalty
 
 
 # -----------------------------------------------------------------------------
@@ -419,6 +483,41 @@ def step_jax(
     obs = _observation(state_new)
     reward = _reward(state_new, action)
     return state_new, obs, reward
+
+
+class NormalizedActionWrapper(gym.ActionWrapper):
+    """Wrapper that normalizes action space to [-1, 1].
+
+    Maps:
+        [-1, 1] -> [low, high] for each action dimension
+
+    This improves training stability for RL algorithms like PPO/SAC.
+    """
+
+    def __init__(self, env: gym.Env):
+        super().__init__(env)
+        self._orig_low = env.action_space.low
+        self._orig_high = env.action_space.high
+        self._orig_range = self._orig_high - self._orig_low
+
+        # New normalized action space
+        self.action_space = spaces.Box(
+            low=-1.0,
+            high=1.0,
+            shape=env.action_space.shape,
+            dtype=np.float32,
+        )
+
+    def action(self, action: np.ndarray) -> np.ndarray:
+        """Convert normalized action [-1, 1] to original action space."""
+        # Map [-1, 1] -> [0, 1] -> [low, high]
+        normalized_01 = (action + 1.0) / 2.0
+        return self._orig_low + normalized_01 * self._orig_range
+
+    def reverse_action(self, action: np.ndarray) -> np.ndarray:
+        """Convert original action to normalized [-1, 1] (for logging)."""
+        normalized_01 = (action - self._orig_low) / self._orig_range
+        return normalized_01 * 2.0 - 1.0
 
 
 if __name__ == "__main__":

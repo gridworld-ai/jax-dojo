@@ -19,7 +19,7 @@ from stable_baselines3.common.callbacks import (
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.vec_env import VecNormalize
 
-from environments import HaberBoschEnv
+from environments import HaberBoschEnv, NormalizedActionWrapper
 from configs.default import (
     ENV_CONFIG,
     PPO_CONFIG,
@@ -74,10 +74,12 @@ class HaberBoschMetricsCallback(BaseCallback):
         return True
 
 
-def make_env(seed: int = 0, **env_kwargs):
+def make_env(seed: int = 0, normalize_actions: bool = True, **env_kwargs):
     """Factory function to create environment instances."""
     def _init():
         env = HaberBoschEnv(**env_kwargs)
+        if normalize_actions:
+            env = NormalizedActionWrapper(env)
         return env
     return _init
 

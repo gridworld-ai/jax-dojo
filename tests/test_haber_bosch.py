@@ -29,6 +29,10 @@ from environments.haber_bosch import (
     M_H2_FEED_NOMINAL_KGS,
 )
 
+# Safe operating values for tests (within soft margins)
+P_SAFE_MID = 126e5  # 126 bar (safe zone: 105-147 bar)
+T_SAFE_MID = 723.0  # 450°C = 723K (safe zone: 643-773K, i.e., 370-500°C)
+
 # Default previous action for tests (nominal operation)
 DEFAULT_PREV_ACTION = jnp.array([1.0, P_NOMINAL_PA, 0.5], dtype=jnp.float32)
 
@@ -214,9 +218,9 @@ class TestReward:
     def test_production_is_positive_component(self):
         """With good conditions, production reward should be positive."""
         state = EnvState(
-            p=jnp.array(P_NOMINAL_PA),
+            p=jnp.array(P_SAFE_MID),  # Safe pressure (126 bar)
             N_gas=jnp.array(1e5),
-            T_reactor=jnp.array(723.0),  # Safe temperature
+            T_reactor=jnp.array(T_SAFE_MID),  # Safe temperature (450°C)
             w_NH3_in=jnp.array(0.05),
             w_NH3_out=jnp.array(0.15),  # Good conversion
             M_loop=jnp.array(2.0),
@@ -224,17 +228,17 @@ class TestReward:
             step=jnp.array(0),
             prev_action=DEFAULT_PREV_ACTION,
         )
-        action = jnp.array([1.0, P_NOMINAL_PA, 0.5])
+        action = DEFAULT_PREV_ACTION  # Same action = no smoothness penalty
         reward = _reward(state, action)
-        # Reward should be positive when operating well
+        # Reward should be positive when operating well in safe zone
         assert float(reward) > 0, "Reward should be positive under good conditions"
 
     def test_high_temperature_penalty(self):
-        """Temperature above max should incur penalty."""
+        """Temperature above safe zone should incur penalty."""
         state_normal = EnvState(
-            p=jnp.array(P_NOMINAL_PA),
+            p=jnp.array(P_SAFE_MID),
             N_gas=jnp.array(1e5),
-            T_reactor=jnp.array(750.0),  # Safe
+            T_reactor=jnp.array(T_SAFE_MID),  # Safe (450°C)
             w_NH3_in=jnp.array(0.05),
             w_NH3_out=jnp.array(0.12),
             M_loop=jnp.array(2.0),
@@ -242,18 +246,18 @@ class TestReward:
             step=jnp.array(0),
             prev_action=DEFAULT_PREV_ACTION,
         )
-        state_hot = state_normal._replace(T_reactor=jnp.array(T_CATALYST_MAX_K - 5.0))
-        action = jnp.array([1.0, P_NOMINAL_PA, 0.5])
+        state_hot = state_normal._replace(T_reactor=jnp.array(T_CATALYST_MAX_K + 5.0))  # Above max
+        action = DEFAULT_PREV_ACTION
         r_normal = _reward(state_normal, action)
         r_hot = _reward(state_hot, action)
         assert float(r_hot) < float(r_normal), "High temperature should reduce reward"
 
     def test_low_temperature_penalty(self):
-        """Temperature below min should incur penalty."""
+        """Temperature below safe zone should incur penalty."""
         state_normal = EnvState(
-            p=jnp.array(P_NOMINAL_PA),
+            p=jnp.array(P_SAFE_MID),
             N_gas=jnp.array(1e5),
-            T_reactor=jnp.array(700.0),  # Safe
+            T_reactor=jnp.array(T_SAFE_MID),  # Safe (450°C)
             w_NH3_in=jnp.array(0.05),
             w_NH3_out=jnp.array(0.12),
             M_loop=jnp.array(2.0),
@@ -261,8 +265,8 @@ class TestReward:
             step=jnp.array(0),
             prev_action=DEFAULT_PREV_ACTION,
         )
-        state_cold = state_normal._replace(T_reactor=jnp.array(T_CATALYST_MIN_K - 10.0))
-        action = jnp.array([1.0, P_NOMINAL_PA, 0.5])
+        state_cold = state_normal._replace(T_reactor=jnp.array(T_CATALYST_MIN_K - 10.0))  # Below min
+        action = DEFAULT_PREV_ACTION
         r_normal = _reward(state_normal, action)
         r_cold = _reward(state_cold, action)
         assert float(r_cold) < float(r_normal), "Low temperature should reduce reward"
@@ -270,9 +274,9 @@ class TestReward:
     def test_overpressure_penalty(self):
         """Pressure above nominal should incur penalty."""
         state_normal = EnvState(
-            p=jnp.array(P_NOMINAL_PA),
+            p=jnp.array(P_SAFE_MID),  # Safe (126 bar)
             N_gas=jnp.array(1e5),
-            T_reactor=jnp.array(723.0),
+            T_reactor=jnp.array(T_SAFE_MID),
             w_NH3_in=jnp.array(0.05),
             w_NH3_out=jnp.array(0.12),
             M_loop=jnp.array(2.0),
@@ -280,8 +284,8 @@ class TestReward:
             step=jnp.array(0),
             prev_action=DEFAULT_PREV_ACTION,
         )
-        state_overpressure = state_normal._replace(p=jnp.array(1.05 * P_NOMINAL_PA))
-        action = jnp.array([1.0, P_NOMINAL_PA, 0.5])
+        state_overpressure = state_normal._replace(p=jnp.array(1.1 * P_NOMINAL_PA))  # 167 bar
+        action = DEFAULT_PREV_ACTION
         r_normal = _reward(state_normal, action)
         r_over = _reward(state_overpressure, action)
         assert float(r_over) < float(r_normal), "Overpressure should reduce reward"
@@ -289,9 +293,9 @@ class TestReward:
     def test_underpressure_penalty(self):
         """Pressure below minimum should incur penalty."""
         state_normal = EnvState(
-            p=jnp.array(P_NOMINAL_PA),
+            p=jnp.array(P_SAFE_MID),  # Safe (126 bar)
             N_gas=jnp.array(1e5),
-            T_reactor=jnp.array(723.0),
+            T_reactor=jnp.array(T_SAFE_MID),
             w_NH3_in=jnp.array(0.05),
             w_NH3_out=jnp.array(0.12),
             M_loop=jnp.array(2.0),
@@ -299,28 +303,29 @@ class TestReward:
             step=jnp.array(0),
             prev_action=DEFAULT_PREV_ACTION,
         )
-        state_underpressure = state_normal._replace(p=jnp.array(0.9 * P_MIN_PA))
-        action = jnp.array([1.0, P_NOMINAL_PA, 0.5])
+        state_underpressure = state_normal._replace(p=jnp.array(0.9 * P_MIN_PA))  # 90 bar
+        action = DEFAULT_PREV_ACTION
         r_normal = _reward(state_normal, action)
         r_under = _reward(state_underpressure, action)
         assert float(r_under) < float(r_normal), "Underpressure should reduce reward"
 
     def test_action_smoothness_penalty(self):
         """Large action changes should incur penalty."""
-        # State with previous action at nominal
+        # State with previous action at safe values
+        prev_act = jnp.array([0.5, P_SAFE_MID, 0.5])
         state = EnvState(
-            p=jnp.array(P_NOMINAL_PA),
+            p=jnp.array(P_SAFE_MID),
             N_gas=jnp.array(1e5),
-            T_reactor=jnp.array(723.0),
+            T_reactor=jnp.array(T_SAFE_MID),
             w_NH3_in=jnp.array(0.05),
             w_NH3_out=jnp.array(0.12),
             M_loop=jnp.array(2.0),
             lambda_load=jnp.array(1.0),
             step=jnp.array(0),
-            prev_action=jnp.array([1.0, P_NOMINAL_PA, 0.5]),  # nominal action
+            prev_action=prev_act,
         )
         # Same action as previous - no smoothness penalty
-        action_same = jnp.array([1.0, P_NOMINAL_PA, 0.5])
+        action_same = prev_act
         # Large action change - should incur penalty
         action_different = jnp.array([0.1, P_MIN_PA, 1.0])
 

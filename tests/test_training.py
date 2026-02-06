@@ -3,7 +3,7 @@
 import pytest
 import numpy as np
 
-from environments import HaberBoschEnv
+from environments import HaberBoschEnv, NormalizedActionWrapper
 from stable_baselines3.common.env_checker import check_env
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
@@ -131,6 +131,53 @@ class TestTrainingSmoke:
         obs = new_env.reset()
         assert obs.shape == (1, 8)
         new_env.close()
+
+
+class TestNormalizedActionWrapper:
+    """Test the normalized action wrapper."""
+
+    def test_action_space_normalized(self):
+        """Wrapped env should have [-1, 1] action space."""
+        env = NormalizedActionWrapper(HaberBoschEnv(max_steps=100))
+        assert env.action_space.low.tolist() == [-1.0, -1.0, -1.0]
+        assert env.action_space.high.tolist() == [1.0, 1.0, 1.0]
+        env.close()
+
+    def test_action_mapping_boundaries(self):
+        """Actions at boundaries should map correctly."""
+        env = NormalizedActionWrapper(HaberBoschEnv(max_steps=100))
+
+        # Test -1 maps to low bounds
+        low_action = env.action(np.array([-1.0, -1.0, -1.0]))
+        assert abs(low_action[0] - 0.1) < 0.01  # lambda min
+        assert abs(low_action[1] - 100e5) < 1e4  # pressure min
+        assert abs(low_action[2] - 0.01) < 0.01  # valve min
+
+        # Test +1 maps to high bounds
+        high_action = env.action(np.array([1.0, 1.0, 1.0]))
+        assert abs(high_action[0] - 1.0) < 0.01  # lambda max
+        assert abs(high_action[1] - 152e5) < 1e4  # pressure max
+        assert abs(high_action[2] - 1.0) < 0.01  # valve max
+        env.close()
+
+    def test_sb3_compatible_with_wrapper(self):
+        """Wrapped environment should pass SB3 check without warning."""
+        from stable_baselines3.common.env_checker import check_env
+        env = NormalizedActionWrapper(HaberBoschEnv(max_steps=100))
+        # This should not raise any warnings about action space
+        check_env(env, warn=True)
+        env.close()
+
+    def test_step_with_normalized_actions(self):
+        """Should be able to step with normalized actions."""
+        env = NormalizedActionWrapper(HaberBoschEnv(max_steps=100))
+        obs, info = env.reset()
+
+        # Step with normalized action [0, 0, 0] (middle of range)
+        obs, reward, done, trunc, info = env.step(np.array([0.0, 0.0, 0.0]))
+        assert obs.shape == (8,)
+        assert isinstance(reward, float)
+        env.close()
 
 
 if __name__ == "__main__":
